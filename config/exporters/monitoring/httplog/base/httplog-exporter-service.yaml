@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: httplog-exporter-service
+  labels:
+    app.kubernetes.io/name: httplog-exporter
+    app.kubernetes.io/component: exporter
+spec:
+  ports:
+  - name: http-metrics
+    port: 8080
+    protocol: TCP
+    targetPort: http-metrics
+  selector:
+    app.kubernetes.io/name: httplog-exporter
+  type: ClusterIP 

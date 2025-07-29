@@ -1,0 +1,20 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: httplog-exporter-service-monitor
+  labels:
+    app.kubernetes.io/name: httplog-exporter
+    app.kubernetes.io/component: exporter
+spec:
+  endpoints:
+  - interval: 30s
+    path: /metrics
+    port: http-metrics
+    scheme: http
+    scrapeTimeout: 10s
+  namespaceSelector:
+    matchNames:
+    - appstudio-workload-monitoring
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: httplog-exporter 

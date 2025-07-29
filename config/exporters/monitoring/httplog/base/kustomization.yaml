@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- httplog-exporter-deployment.yaml
+- httplog-exporter-service.yaml
+- httplog-exporter-service-monitor.yaml
+
+namespace: appstudio-workload-monitoring
+
+commonLabels:
+  app.kubernetes.io/name: httplog-exporter
+  app.kubernetes.io/part-of: konflux-monitoring
+
+images:
+- name: httplog-exporter
+  newTag: latest 
