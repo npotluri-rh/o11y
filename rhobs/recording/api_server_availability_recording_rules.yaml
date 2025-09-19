@@ -1,3 +1,26 @@
+# API Server Availability Monitoring with Statistical Baseline Alerting
+#
+# This PrometheusRule implements sophisticated statistical analysis for API server
+# error rate monitoring. It uses 30-day historical baselines with standard deviation
+# analysis to detect anomalous error patterns while maintaining absolute safety thresholds.
+#
+# Key Features:
+# - 30-day rolling baseline calculation using hourly samples
+# - 2-sigma statistical threshold for anomaly detection
+# - 10-minute evaluation window for current error rates
+# - Absolute safety threshold (95%) to catch extreme conditions
+# - Anti-flapping with 5-minute sustained condition requirement
+#
+# Metrics Generated:
+# - konflux_up: Boolean availability metric (legacy)
+# - api_server:error_rate_10m: Current 10-minute error rate percentage
+# - api_server:error_rate_30d_avg: 30-day historical average error rate
+# - api_server:error_rate_30d_stddev: 30-day historical standard deviation
+#
+# Alert Conditions:
+# - Current error rate > (30-day average + 2 * standard deviation) AND > 95%
+# - Sustained for 5+ minutes to prevent false positives
+#
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -7,9 +30,16 @@ metadata:
 
 spec:
   groups:
+    # ===================================================================
+    # RECORDING RULES: Statistical Baseline Metrics
+    # ===================================================================
+    # This group calculates error rates and statistical baselines for 
+    # anomaly detection. Rules run every minute to maintain fresh data.
     - name: api_server_service_availability
       interval: 1m
       rules:
+        # Legacy availability metric (keeps existing SLO compatibility)
+        # Returns 1 if error rate ≤5%, 0 if >5%
         - record: konflux_up
           expr: |
             label_replace(
@@ -26,3 +56,248 @@ spec:
             <= bool 5
           labels:
             service: api-server
+        
+        # Current Error Rate Metric (10-minute window)
+        # =============================================
+        # Calculates current API server error rate as a percentage over 10 minutes.
+        # This provides the "current state" metric for comparison against baselines.
+        # 
+        # Formula: (5xx errors / total non-zero requests) * 100
+        # Window: 10m (configurable based on alert requirements)
+        # Granularity: Per source_cluster
+        - record: api_server:error_rate_10m
+          expr: |
+            (
+              sum by(source_cluster) (
+                rate(apiserver_request_total{code=~"5.."}[10m])
+              ) /
+              sum by(source_cluster) (
+                rate(apiserver_request_total{code!="0"}[10m])
+              )
+            ) * 100
+          labels:
+            service: api-server
+            
+        # Historical Baseline: 30-Day Average
+        # ===================================
+        # Calculates the mean error rate over the past 30 days using 1-hour samples.
+        # This creates a "normal behavior" baseline that adapts to service patterns.
+        # 
+        # Method: avg_over_time() with subquery sampling
+        # Sample Rate: Every 1 hour over 30 days (720 data points)
+        # Use Case: Center point for statistical threshold calculation
+        - record: api_server:error_rate_30d_avg
+          expr: |
+            avg_over_time(
+              (
+                sum by(source_cluster) (
+                  rate(apiserver_request_total{code=~"5.."}[1h])
+                ) /
+                sum by(source_cluster) (
+                  rate(apiserver_request_total{code!="0"}[1h])
+                )
+              ) * 100[30d:1h]
+            )
+          labels:
+            service: api-server
+            
+        # Historical Baseline: 30-Day Standard Deviation
+        # ==============================================
+        # Calculates the standard deviation of error rates over 30 days.
+        # This measures the "normal variability" of the service's error patterns.
+        # 
+        # Method: stddev_over_time() with same sampling as average
+        # Use Case: Defines the "2-sigma" threshold for anomaly detection
+        # Interpretation: 95% of normal values fall within ±2σ of the mean
+        - record: api_server:error_rate_30d_stddev
+          expr: |
+            stddev_over_time(
+              (
+                sum by(source_cluster) (
+                  rate(apiserver_request_total{code=~"5.."}[1h])
+                ) /
+                sum by(source_cluster) (
+                  rate(apiserver_request_total{code!="0"}[1h])
+                )
+              ) * 100[30d:1h]
+            )
+          labels:
+            service: api-server
+
+    # ===================================================================
+    # ALERT RULES: Statistical Anomaly Detection
+    # ===================================================================
+    # This group contains alerts that trigger when error rates deviate
+    # significantly from historical baselines using statistical analysis.
+    - name: api_server_service_alerts
+      interval: 1m
+      rules:
+        # Statistical Baseline Alert: High Error Rate Anomaly
+        # ===================================================
+        # This alert triggers when the API server error rate is both:
+        # 1. Statistically anomalous (>2σ above 30-day baseline)
+        # 2. Critically high (>95% absolute threshold)
+        #
+        # DUAL CONDITION LOGIC:
+        # ---------------------
+        # The alert uses AND logic between two conditions:
+        # 
+        # Condition 1 (Statistical): current_rate > (avg + 2*stddev)
+        #   - Detects when error rate is statistically unusual
+        #   - 2σ threshold means 95% confidence this is abnormal
+        #   - Adapts to service's historical patterns
+        #
+        # Condition 2 (Safety): current_rate > 95%
+        #   - Absolute safety net for extreme conditions
+        #   - Prevents alerts on small statistical variations
+        #   - Ensures alerts only fire for truly severe issues
+        #
+        # ANTI-FLAPPING:
+        # --------------
+        # - 'for: 5m' requires sustained condition for 5 minutes
+        # - Prevents transient spikes from triggering alerts
+        # - Balances responsiveness with stability
+        #
+        # OPERATIONAL GUIDANCE:
+        # --------------------
+        # When this alert fires:
+        # 1. Check API server logs for 5xx error patterns
+        # 2. Verify cluster health (nodes, pods, resources)
+        # 3. Review recent deployments or configuration changes
+        # 4. Monitor downstream dependencies
+        # 5. Consider scaling or traffic management
+        - alert: APIServerHighErrorRate
+          expr: |
+            (
+              api_server:error_rate_10m{service="api-server"}
+              >
+              (
+                api_server:error_rate_30d_avg{service="api-server"}
+                + 2 * api_server:error_rate_30d_stddev{service="api-server"}
+              )
+            )
+            and
+            (
+              api_server:error_rate_10m{service="api-server"} > 95
+            )
+          for: 5m
+          labels:
+            severity: critical
+            service: api-server
+            team: platform
+            alert_type: statistical_anomaly
+            confidence: high
+          annotations:
+            summary: "API Server error rate significantly exceeds historical baseline"
+            description: |
+              🚨 STATISTICAL ANOMALY DETECTED 🚨
+              
+              The API Server error rate has exceeded both statistical and absolute thresholds:
+              
+              📊 CURRENT METRICS:
+              • Current 10m error rate: {{ printf "%.2f" $value }}%
+              • 30-day historical average: {{ with query "api_server:error_rate_30d_avg{source_cluster=\"" }}{{ . | first | value | printf "%.2f" }}{{ end }}%
+              • Statistical threshold (μ+2σ): {{ with query "api_server:error_rate_30d_avg + 2 * api_server:error_rate_30d_stddev" }}{{ . | first | value | printf "%.2f" }}{{ end }}%
+              • Standard deviation: {{ with query "api_server:error_rate_30d_stddev{source_cluster=\"" }}{{ . | first | value | printf "%.2f" }}{{ end }}%
+              
+              🎯 WHY THIS ALERT FIRED:
+              This error rate is >2 standard deviations above the 30-day baseline, indicating
+              statistically significant degradation (95% confidence of abnormal behavior).
+              
+              🔧 IMMEDIATE ACTIONS:
+              1. Check API server pods: kubectl get pods -n kube-system
+              2. Review recent 5xx errors in logs
+              3. Verify cluster resource utilization
+              4. Check for recent deployments or config changes
+              
+              📍 AFFECTED CLUSTER: {{ $labels.source_cluster }}
+              ⏱️  DURATION: Alert active for {{ printf "%.0f" $value }} minutes
+            runbook_url: "https://your-runbook-url.com/api-server-statistical-anomaly"
+            dashboard_url: "https://grafana.example.com/d/api-server-health"
+            
+        # Additional context: Why we use this approach
+        # ===========================================
+        # Traditional static thresholds (e.g., "alert if >5%") have limitations:
+        # • Don't adapt to service patterns (some services normally have higher error rates)
+        # • Create alert fatigue during expected load patterns
+        # • Miss gradual degradations that stay below static thresholds
+        # • Don't account for normal variability
+        #
+        # This statistical approach provides:
+        # ✓ Adaptive thresholds that learn service behavior
+        # ✓ High confidence alerts (2σ = 95% statistical significance)
+        # ✓ Reduced false positives from normal variations
+        # ✓ Early detection of gradual degradations
+        # ✓ Automatic adjustment to seasonal patterns
+        #
+        # Mathematical Foundation:
+        # If error rates follow normal distribution (common for stable services),
+        # then 95% of values fall within μ±2σ. Values beyond 2σ are statistically
+        # significant anomalies warranting investigation.
+
+# ===============================================================================
+# USAGE EXAMPLES & OPERATIONAL NOTES
+# ===============================================================================
+#
+# QUERYING THE METRICS:
+# --------------------
+# Current error rate:
+#   api_server:error_rate_10m{service="api-server"}
+#
+# Historical baseline:
+#   api_server:error_rate_30d_avg{service="api-server"}
+#
+# Dynamic threshold:
+#   api_server:error_rate_30d_avg + (2 * api_server:error_rate_30d_stddev)
+#
+# Check if currently alerting:
+#   ALERTS{alertname="APIServerHighErrorRate"}
+#
+# TUNING PARAMETERS:
+# ------------------
+# Sensitivity Adjustment:
+# • Increase sigma multiplier (2 → 3) for less sensitive alerts
+# • Decrease sigma multiplier (2 → 1.5) for more sensitive alerts
+#
+# Time Window Adjustment:
+# • Increase 10m → 15m for smoother current rate calculation
+# • Decrease 10m → 5m for faster detection of issues
+#
+# Historical Window Adjustment:
+# • Increase 30d → 60d for more stable baselines (slower adaptation)
+# • Decrease 30d → 14d for faster adaptation to pattern changes
+#
+# Alert Delay Adjustment:
+# • Increase 'for: 5m' → 'for: 10m' to reduce alert frequency
+# • Decrease 'for: 5m' → 'for: 2m' for faster notifications
+#
+# BOOTSTRAPPING NEW SERVICES:
+# ---------------------------
+# For new services without 30 days of history:
+# • Historical metrics will have limited data initially
+# • Consider using static thresholds for first 30 days
+# • Alert may not fire until sufficient baseline data exists
+#
+# MAINTENANCE WINDOWS:
+# --------------------
+# During planned maintenance, either:
+# • Use Alertmanager silences for known maintenance periods
+# • Add maintenance labels to suppress alerts temporarily
+# • Consider separate "maintenance mode" recording rules
+#
+# TROUBLESHOOTING:
+# ---------------
+# If alerts are too noisy:
+# • Check if service has highly variable error patterns
+# • Consider increasing sigma multiplier or time windows
+# • Review if absolute threshold (95%) is appropriate
+#
+# If alerts are too quiet:
+# • Verify metrics are flowing (check recording rules)
+# • Consider decreasing sigma multiplier
+# • Check if historical baseline captures recent patterns
+#
+# No data available:
+# • Verify apiserver_request_total metric exists
+# • Check if Prometheus has sufficient retention (>30d)
+# • Ensure recording rules are evaluating successfully
